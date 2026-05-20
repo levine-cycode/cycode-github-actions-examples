@@ -1,0 +1,41 @@
+# Consumer workflow that calls the centralized Cycode scan reusable workflow.
+#
+# To adopt this pattern in a target repo:
+#   1. Copy this file to .github/workflows/cycode-scan.yml in your repo.
+#   2. Add CYCODE_CLIENT_ID and CYCODE_CLIENT_SECRET as repository secrets
+#      (Settings → Secrets and variables → Actions → New repository secret).
+#   3. Adjust the `uses:` pin and the `with:` inputs as needed.
+
+name: Cycode security scan
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  cycode:
+    uses: levine-cycode/cycode-github-actions-examples/.github/workflows/cycode-scan.yml@v1
+    with:
+      # Any subset of: secret, sast, sca, iac. Scans run in the listed order.
+      # scanTypes is a JSON-array string (reusable workflow inputs cannot be
+      # native arrays). Single quotes around the JSON are required.
+      scanTypes: '["secret","sca","iac","sast"]'
+
+      # info | low | medium | high | critical. Findings at or above this
+      # severity count toward the gate.
+      severityThreshold: high
+
+      # true  → job fails on findings at or above the threshold
+      # false → scan and publish summary without failing
+      blockOnFindings: true
+
+      # Optional: ubuntu-latest (default) | windows-2022 | macos-latest | self-hosted
+      # runsOn: ubuntu-latest
+
+      # Optional: '' = auto (push/PR → diff, manual/schedule → full)
+      # Override with 'diff' or 'full' to force.
+      # scanMode: ''
+
+    secrets: inherit

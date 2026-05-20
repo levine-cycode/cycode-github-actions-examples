@@ -1,0 +1,329 @@
+# Centralized Cycode scan reusable workflow.
+#
+# Single source of truth for the Cycode CI/CD gate across many repos.
+# Consumers `uses:` this workflow and pass scan-type / threshold / gate inputs;
+# this workflow handles install, scan, summary, artifacts, and gating.
+#
+# Usage (in the consumer repo):
+#   jobs:
+#     cycode:
+#       uses: levine-cycode/cycode-github-actions-examples/.github/workflows/cycode-scan.yml@v1
+#       with:
+#         scanTypes: '["secret","sca","iac","sast"]'
+#         severityThreshold: high
+#         blockOnFindings: true
+#       secrets: inherit
+#
+# Behavior summary:
+#   - Runs on ubuntu-latest by default (override via runsOn input).
+#   - Installs the Cycode CLI via `pip install cycode`.
+#   - Auto-detects scan mode from the triggering event
+#     (push / pull_request → diff, manual / schedule → full).
+#   - For diff scans, BASE is taken from the event payload:
+#       push:         github.event.before
+#       pull_request: github.event.pull_request.base.sha
+#     Falls back to a full scan if BASE cannot be resolved.
+#   - Appends a per-scan-type summary to the job summary tab.
+#   - Uploads raw Cycode JSON output as a single `cycode-scan-results` artifact.
+#   - Fails the job on findings at or above severityThreshold when
+#     blockOnFindings is true; otherwise scans and reports without failing.
+
+name: Cycode Scan
+
+on:
+  workflow_call:
+    inputs:
+      scanTypes:
+        description: 'JSON array of scan types. Any subset of ["secret","sast","sca","iac"]. Scans run in the listed order.'
+        type: string
+        default: '["secret"]'
+      severityThreshold:
+        description: 'info | low | medium | high | critical'
+        type: string
+        default: 'high'
+      blockOnFindings:
+        description: 'true = fail on findings at or above threshold; false = scan and report only'
+        type: boolean
+        default: true
+      runsOn:
+        description: 'Runner image label (ubuntu-latest | windows-2022 | macos-latest | self-hosted | ...)'
+        type: string
+        default: 'ubuntu-latest'
+      scanMode:
+        description: 'Empty string = auto-detect (push/PR → diff, manual/schedule → full). Override with "full" or "diff".'
+        type: string
+        default: ''
+    secrets:
+      CYCODE_CLIENT_ID:
+        required: true
+      CYCODE_CLIENT_SECRET:
+        required: true
+
+jobs:
+  cycode-scan:
+    name: Cycode scan + gate
+    runs-on: ${{ inputs.runsOn }}
+    # Default timeout matches the ADO template. Raise this in your caller
+    # workflow if you have a large monorepo or a long-stale branch whose
+    # first-ever diff spans many commits.
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      OUT_DIR: ${{ github.workspace }}/.cycode-out
+      CYCODE_CLIENT_ID: ${{ secrets.CYCODE_CLIENT_ID }}
+      CYCODE_CLIENT_SECRET: ${{ secrets.CYCODE_CLIENT_SECRET }}
+    steps:
+      # ---- Validate inputs at the top so misconfiguration fails loudly --
+      - name: Validate inputs
+        shell: bash
+        env:
+          SCAN_TYPES_INPUT: ${{ inputs.scanTypes }}
+          SEVERITY_INPUT: ${{ inputs.severityThreshold }}
+          SCAN_MODE_INPUT: ${{ inputs.scanMode }}
+        run: |
+          set -euo pipefail
+          case "$SEVERITY_INPUT" in
+            info|low|medium|high|critical) ;;
+            *) echo "::error::severityThreshold must be one of info|low|medium|high|critical (got '$SEVERITY_INPUT')"; exit 1 ;;
+          esac
+          case "$SCAN_MODE_INPUT" in
+            ""|full|diff) ;;
+            *) echo "::error::scanMode must be empty, 'full', or 'diff' (got '$SCAN_MODE_INPUT')"; exit 1 ;;
+          esac
+          if ! echo "$SCAN_TYPES_INPUT" | jq -e 'type == "array" and length > 0' >/dev/null 2>&1; then
+            echo "::error::scanTypes must be a non-empty JSON array string, e.g. '[\"secret\",\"sca\"]' (got: $SCAN_TYPES_INPUT)"
+            exit 1
+          fi
+          for t in $(echo "$SCAN_TYPES_INPUT" | jq -r '.[]'); do
+            case "$t" in
+              secret|sast|sca|iac) ;;
+              *) echo "::error::Invalid scanType '$t'. Allowed: secret, sast, sca, iac."; exit 1 ;;
+            esac
+          done
+
+      # ---- Checkout caller repo with full history for diff scans --------
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Long-paths flag is a no-op on Linux/macOS but matters on windows-*
+      # runners where Java/.NET artifact paths routinely exceed 260 chars.
+      - name: Enable git long paths
+        shell: bash
+        run: git config --global core.longpaths true || true
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Cycode CLI
+        shell: bash
+        run: pip install --quiet cycode
+
+      # ---- Resolve effective scan mode + BASE commit --------------------
+      # GitHub Actions exposes the previous SHA directly in the event
+      # payload, so we don't need a REST lookup (unlike the ADO version).
+      - name: Resolve scan mode + BASE commit
+        id: resolve
+        shell: bash
+        env:
+          SCAN_MODE_INPUT: ${{ inputs.scanMode }}
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$OUT_DIR"
+
+          MODE="$SCAN_MODE_INPUT"
+          if [ -z "$MODE" ]; then
+            case "$EVENT_NAME" in
+              push|pull_request) MODE="diff" ;;
+              *)                 MODE="full" ;;
+            esac
+          fi
+          echo "event=$EVENT_NAME  scanMode(input)='$SCAN_MODE_INPUT'  effective=$MODE"
+
+          BASE=""
+          if [ "$MODE" = "diff" ]; then
+            case "$EVENT_NAME" in
+              pull_request)
+                BASE="$PR_BASE_SHA"
+                ;;
+              push)
+                # New-branch push has before=00..00. Treat as no base.
+                if [ -n "$PUSH_BEFORE" ] && [ "$PUSH_BEFORE" != "0000000000000000000000000000000000000000" ]; then
+                  BASE="$PUSH_BEFORE"
+                fi
+                ;;
+            esac
+
+            if [ -z "$BASE" ]; then
+              BASE="$(git rev-parse HEAD~1 2>/dev/null || true)"
+            fi
+
+            if [ -n "$BASE" ] && ! git cat-file -e "${BASE}^{commit}" 2>/dev/null; then
+              echo "::warning::BASE commit $BASE is not present in local history (force-push or shallow fetch). Falling back to full scan."
+              BASE=""
+            fi
+
+            if [ -z "$BASE" ]; then
+              echo "::warning::Could not resolve a BASE commit for diff scan; falling back to a full scan."
+              MODE="full"
+            else
+              echo "Resolved BASE commit: $BASE"
+            fi
+          fi
+
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+          echo "base=$BASE" >> "$GITHUB_OUTPUT"
+
+      # ---- Run scans in declared order ----------------------------------
+      # Sequential loop preserves ordering. IaC always uses path mode —
+      # Cycode CLI does not support commit-history for IaC. --soft-fail
+      # ensures the scan writes its JSON even when findings exist; the
+      # gate step handles the fail decision.
+      - name: Run Cycode scans
+        shell: bash
+        env:
+          SCAN_TYPES_INPUT: ${{ inputs.scanTypes }}
+          SEVERITY_THRESHOLD: ${{ inputs.severityThreshold }}
+          SCAN_MODE: ${{ steps.resolve.outputs.mode }}
+          BASE_COMMIT: ${{ steps.resolve.outputs.base }}
+        run: |
+          set -e
+          mkdir -p "$OUT_DIR"
+          for scan_type in $(echo "$SCAN_TYPES_INPUT" | jq -r '.[]'); do
+            OUT_FILE="$OUT_DIR/cycode-$scan_type.json"
+            if [ "$SCAN_MODE" = "diff" ] && [ "$scan_type" != "iac" ] && [ -n "$BASE_COMMIT" ]; then
+              echo "::group::Cycode $scan_type scan (diff: $BASE_COMMIT..HEAD)"
+              cycode --verbose -o json scan --soft-fail \
+                -t "$scan_type" \
+                --severity-threshold "$SEVERITY_THRESHOLD" \
+                commit-history -r "$BASE_COMMIT..HEAD" . \
+                > "$OUT_FILE" || true
+            else
+              echo "::group::Cycode $scan_type scan (full tree, path mode)"
+              cycode --verbose -o json scan --soft-fail \
+                -t "$scan_type" \
+                --severity-threshold "$SEVERITY_THRESHOLD" \
+                path . \
+                > "$OUT_FILE" || true
+            fi
+            echo "::endgroup::"
+          done
+          ls -la "$OUT_DIR"
+
+      # ---- Append per-scan-type summary to the job summary --------------
+      - name: Build job summary
+        if: always()
+        shell: bash
+        env:
+          SCAN_TYPES_INPUT: ${{ inputs.scanTypes }}
+          SEVERITY_THRESHOLD: ${{ inputs.severityThreshold }}
+          BLOCK_ON_FINDINGS: ${{ inputs.blockOnFindings }}
+          SCAN_MODE: ${{ steps.resolve.outputs.mode }}
+          BASE_COMMIT: ${{ steps.resolve.outputs.base }}
+        run: |
+          set -e
+          {
+            echo "## Cycode scan summary"
+            echo ""
+            echo "- **Repo:** \`${{ github.repository }}\`"
+            echo "- **Ref:** \`${{ github.ref }}\`"
+            echo "- **Scan mode:** \`$SCAN_MODE\`"
+            if [ "$SCAN_MODE" = "diff" ] && [ -n "$BASE_COMMIT" ]; then
+              echo "- **Diff base:** \`$BASE_COMMIT\`"
+            fi
+            echo "- **Severity threshold:** \`$SEVERITY_THRESHOLD\`"
+            echo "- **Block on findings:** \`$BLOCK_ON_FINDINGS\`"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # jq filter that pulls detections from either envelope shape
+          # Cycode emits (.scan_results[].detections OR top-level .detections)
+          # and normalizes severity to lowercase for counting.
+          DETECT_FILTER='[(.scan_results[]?.detections[]?), (.detections[]?)]'
+
+          for scan_type in $(echo "$SCAN_TYPES_INPUT" | jq -r '.[]'); do
+            JSON_FILE="$OUT_DIR/cycode-$scan_type.json"
+            echo "### Cycode $scan_type" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            if [ ! -s "$JSON_FILE" ] || ! jq -e 'has("scan_results") or has("detections")' "$JSON_FILE" >/dev/null 2>&1; then
+              echo "Scan output missing or malformed. See the \`Run Cycode scans\` step log for the failure." >> "$GITHUB_STEP_SUMMARY"
+              echo "" >> "$GITHUB_STEP_SUMMARY"
+              continue
+            fi
+            total=$(jq "$DETECT_FILTER | length" "$JSON_FILE")
+            crit=$(jq "$DETECT_FILTER | map(select((.severity // .detection_details.severity // \"\" | ascii_downcase) == \"critical\")) | length" "$JSON_FILE")
+            high=$(jq "$DETECT_FILTER | map(select((.severity // .detection_details.severity // \"\" | ascii_downcase) == \"high\"))     | length" "$JSON_FILE")
+            med=$(jq  "$DETECT_FILTER | map(select((.severity // .detection_details.severity // \"\" | ascii_downcase) == \"medium\"))   | length" "$JSON_FILE")
+            low=$(jq  "$DETECT_FILTER | map(select((.severity // .detection_details.severity // \"\" | ascii_downcase) == \"low\"))      | length" "$JSON_FILE")
+            {
+              echo "Total: $total · Critical: $crit · High: $high · Medium: $med · Low: $low"
+              echo ""
+            } >> "$GITHUB_STEP_SUMMARY"
+          done
+
+      # ---- Upload raw JSON for every scan type as one artifact ----------
+      - name: Upload Cycode scan results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cycode-scan-results
+          path: ${{ env.OUT_DIR }}/cycode-*.json
+          if-no-files-found: warn
+
+      # ---- Gate ---------------------------------------------------------
+      # Loud-fails on missing/malformed output or non-empty .errors[] so an
+      # auth, network, or CLI failure upstream cannot silently bypass the
+      # gate as "0 findings". When blockOnFindings is false, the gate still
+      # validates output integrity but exits 0 on findings (warn-only).
+      - name: Gate
+        if: always()
+        shell: bash
+        env:
+          SCAN_TYPES_INPUT: ${{ inputs.scanTypes }}
+          SEVERITY_THRESHOLD: ${{ inputs.severityThreshold }}
+          BLOCK_ON_FINDINGS: ${{ inputs.blockOnFindings }}
+        run: |
+          set -e
+          GATE_FAIL=0
+          for scan_type in $(echo "$SCAN_TYPES_INPUT" | jq -r '.[]'); do
+            JSON_FILE="$OUT_DIR/cycode-$scan_type.json"
+
+            if [ ! -s "$JSON_FILE" ]; then
+              echo "::error::Cycode $scan_type scan produced no output ($JSON_FILE empty or missing). The scan step likely failed; review its log."
+              GATE_FAIL=1
+              continue
+            fi
+            if ! jq -e 'has("scan_results") or has("detections")' "$JSON_FILE" >/dev/null 2>&1; then
+              echo "::error::Cycode $scan_type scan output is malformed (no scan_results or detections key in $JSON_FILE). Review the scan log."
+              GATE_FAIL=1
+              continue
+            fi
+            err_count=$(jq '.errors // [] | length' "$JSON_FILE")
+            if [ "$err_count" -gt 0 ]; then
+              err_msg=$(jq -r '.errors | map(tostring) | join(" | ")' "$JSON_FILE")
+              echo "::error::Cycode $scan_type scan reported $err_count error(s): $err_msg"
+              GATE_FAIL=1
+              continue
+            fi
+
+            count=$(jq '[(.scan_results[]?.detections[]?), (.detections[]?)] | length' "$JSON_FILE")
+            echo "$scan_type findings at or above $SEVERITY_THRESHOLD: $count"
+            if [ "$count" -gt 0 ]; then
+              if [ "$BLOCK_ON_FINDINGS" = "true" ]; then
+                echo "::error::Cycode $scan_type scan found $count finding(s) at or above $SEVERITY_THRESHOLD. See cycode-scan-results artifact."
+                GATE_FAIL=1
+              else
+                echo "::warning::Cycode $scan_type scan found $count finding(s) at or above $SEVERITY_THRESHOLD. blockOnFindings=false; not failing the build."
+              fi
+            fi
+          done
+          if [ "$GATE_FAIL" -ne 0 ]; then
+            exit 1
+          fi

@@ -1,0 +1,25 @@
+# Self-scan: runs the centralized Cycode scan workflow against THIS repo on
+# every PR and push to main. Proves the workflow actually executes end-to-end
+# once CYCODE_CLIENT_ID and CYCODE_CLIENT_SECRET are configured as repo secrets.
+#
+# Uses a local path reference (./.github/workflows/cycode-scan.yml) so changes
+# to the workflow are exercised on the same PR that introduces them. Customers
+# should NOT copy this style — they should pin to a tag (see examples/).
+
+name: Self-scan
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  cycode:
+    uses: ./.github/workflows/cycode-scan.yml
+    with:
+      scanTypes: '["secret","sca","iac"]'
+      severityThreshold: high
+      # Demo repo: report findings without failing PRs.
+      blockOnFindings: false
+    secrets: inherit

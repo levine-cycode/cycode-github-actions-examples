@@ -7,7 +7,7 @@
 # Usage (in the consumer repo):
 #   jobs:
 #     cycode:
-#       uses: levine-cycode/cycode-github-actions-examples/.github/workflows/cycode-scan.yml@v1
+#       uses: <owner>/<repo>/.github/workflows/cycode-scan.yml@v1
 #       with:
 #         scanTypes: '["secret","sca","iac","sast"]'
 #         severityThreshold: high

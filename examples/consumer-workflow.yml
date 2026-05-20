@@ -16,7 +16,7 @@ on:
 
 jobs:
   cycode:
-    uses: levine-cycode/cycode-github-actions-examples/.github/workflows/cycode-scan.yml@v1
+    uses: <owner>/<repo>/.github/workflows/cycode-scan.yml@v1
     with:
       # Any subset of: secret, sast, sca, iac. Scans run in the listed order.
       # scanTypes is a JSON-array string (reusable workflow inputs cannot be

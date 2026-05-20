@@ -71,7 +71,7 @@ on:
 
 jobs:
   cycode:
-    uses: levine-cycode/cycode-github-actions-examples/.github/workflows/cycode-scan.yml@v1
+    uses: <owner>/<repo>/.github/workflows/cycode-scan.yml@v1
     with:
       scanTypes: '["secret","sca","iac","sast"]'   # any subset of: secret, sast, sca, iac
       severityThreshold: high                       # info | low | medium | high | critical
@@ -94,8 +94,8 @@ jobs:
 In production, pin to a tag (or a SHA for stricter supply-chain controls):
 
 ```yaml
-uses: levine-cycode/cycode-github-actions-examples/.github/workflows/cycode-scan.yml@v1
-uses: levine-cycode/cycode-github-actions-examples/.github/workflows/cycode-scan.yml@<full-sha>
+uses: <owner>/<repo>/.github/workflows/cycode-scan.yml@v1
+uses: <owner>/<repo>/.github/workflows/cycode-scan.yml@<full-sha>
 ```
 
 `@main` is fine for evaluation but means every consumer picks up changes immediately.

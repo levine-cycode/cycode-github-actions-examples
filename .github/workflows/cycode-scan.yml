@@ -2,7 +2,7 @@
 #
 # Single source of truth for the Cycode CI/CD gate across many repos.
 # Consumers `uses:` this workflow and pass scan-type / threshold / gate inputs;
-# this workflow handles install, scan, summary, artifacts, and gating.
+# this workflow handles install, scan, rich summary, artifacts, and gating.
 #
 # Usage (in the consumer repo):
 #   jobs:
@@ -12,6 +12,7 @@
 #         scanTypes: '["secret","sca","iac","sast"]'
 #         severityThreshold: high
 #         blockOnFindings: true
+#         outputFormats: '["json","csv","md","html"]'
 #       secrets: inherit
 #
 # Behavior summary:
@@ -19,12 +20,14 @@
 #   - Installs the Cycode CLI via `pip install cycode`.
 #   - Auto-detects scan mode from the triggering event
 #     (push / pull_request → diff, manual / schedule → full).
-#   - For diff scans, BASE is taken from the event payload:
-#       push:         github.event.before
-#       pull_request: github.event.pull_request.base.sha
-#     Falls back to a full scan if BASE cannot be resolved.
-#   - Appends a per-scan-type summary to the job summary tab.
-#   - Uploads raw Cycode JSON output as a single `cycode-scan-results` artifact.
+#   - For diff scans, BASE is taken from the event payload.
+#   - Appends a rich per-scan-type summary (severity table + per-finding
+#     details with file/line links) to the job summary tab.
+#   - Emits `::error file=path,line=N` annotations for each finding at or
+#     above severityThreshold so they appear inline on the run page.
+#   - Uploads requested output formats as a single `cycode-scan-results`
+#     artifact. Raw JSON is always included (gate dependency); CSV / MD /
+#     HTML are added when listed in outputFormats.
 #   - Fails the job on findings at or above severityThreshold when
 #     blockOnFindings is true; otherwise scans and reports without failing.
 
@@ -53,6 +56,10 @@ on:
         description: 'Empty string = auto-detect (push/PR → diff, manual/schedule → full). Override with "full" or "diff".'
         type: string
         default: ''
+      outputFormats:
+        description: 'JSON array of artifact formats. Subset of ["json","csv","md","html"]. JSON is always included regardless (gate dependency); the others are added on request. Default ["json"].'
+        type: string
+        default: '["json"]'
     secrets:
       CYCODE_CLIENT_ID:
         required: true
@@ -71,6 +78,10 @@ jobs:
       contents: read
     env:
       OUT_DIR: ${{ github.workspace }}/.cycode-out
+      # Summary MDs live in runner.temp so they're available to the job-summary
+      # step even when the caller didn't request md as an artifact format.
+      SUMMARY_DIR: ${{ runner.temp }}/cycode-summary
+      SUMMARY_SCRIPT: ${{ runner.temp }}/cycode-summary.py
       CYCODE_CLIENT_ID: ${{ secrets.CYCODE_CLIENT_ID }}
       CYCODE_CLIENT_SECRET: ${{ secrets.CYCODE_CLIENT_SECRET }}
     steps:
@@ -81,6 +92,7 @@ jobs:
           SCAN_TYPES_INPUT: ${{ inputs.scanTypes }}
           SEVERITY_INPUT: ${{ inputs.severityThreshold }}
           SCAN_MODE_INPUT: ${{ inputs.scanMode }}
+          OUTPUT_FORMATS_INPUT: ${{ inputs.outputFormats }}
         run: |
           set -euo pipefail
           case "$SEVERITY_INPUT" in
@@ -99,6 +111,16 @@ jobs:
             case "$t" in
               secret|sast|sca|iac) ;;
               *) echo "::error::Invalid scanType '$t'. Allowed: secret, sast, sca, iac."; exit 1 ;;
+            esac
+          done
+          if ! echo "$OUTPUT_FORMATS_INPUT" | jq -e 'type == "array" and length > 0' >/dev/null 2>&1; then
+            echo "::error::outputFormats must be a non-empty JSON array string, e.g. '[\"json\",\"csv\"]' (got: $OUTPUT_FORMATS_INPUT)"
+            exit 1
+          fi
+          for f in $(echo "$OUTPUT_FORMATS_INPUT" | jq -r '.[]'); do
+            case "$f" in
+              json|csv|md|html) ;;
+              *) echo "::error::Invalid outputFormat '$f'. Allowed: json, csv, md, html."; exit 1 ;;
             esac
           done
 
@@ -122,6 +144,21 @@ jobs:
       - name: Install Cycode CLI
         shell: bash
         run: pip install --quiet cycode
+
+      # ---- Fetch the summary-report generator script --------------------
+      # Lands in runner.temp (outside the workspace) so it isn't scanned as
+      # caller-repo source. Sourced from this templates repo's main branch;
+      # consumers who fork should change the URL.
+      - name: Fetch Cycode summary script
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$SUMMARY_DIR"
+          curl -fsSL \
+            "https://raw.githubusercontent.com/levine-cycode/cycode-github-actions-examples/main/scripts/cycode-summary.py" \
+            -o "$SUMMARY_SCRIPT"
+          python3 -c "import py_compile; py_compile.compile('$SUMMARY_SCRIPT', doraise=True)"
+          echo "Fetched and compiled $SUMMARY_SCRIPT"
 
       # ---- Resolve effective scan mode + BASE commit --------------------
       # GitHub Actions exposes the previous SHA directly in the event
@@ -217,7 +254,52 @@ jobs:
           done
           ls -la "$OUT_DIR"
 
-      # ---- Append per-scan-type summary to the job summary --------------
+      # ---- Generate report formats (always MD for summary; CSV/HTML on request)
+      # The python summary script reads each cycode-<type>.json and produces a
+      # rich markdown summary, plus CSV / HTML if requested. MD always goes to
+      # SUMMARY_DIR (consumed by the next step). MD / CSV / HTML also go to
+      # OUT_DIR when listed in outputFormats so they ride along in the artifact.
+      - name: Generate report formats
+        if: always()
+        shell: bash
+        env:
+          SCAN_TYPES_INPUT: ${{ inputs.scanTypes }}
+          OUTPUT_FORMATS: ${{ inputs.outputFormats }}
+          SCAN_MODE: ${{ steps.resolve.outputs.mode }}
+          BASE_COMMIT: ${{ steps.resolve.outputs.base }}
+        run: |
+          set -e
+          mkdir -p "$OUT_DIR" "$SUMMARY_DIR"
+          want_md=$(echo   "$OUTPUT_FORMATS" | jq -r 'index("md")   | if . == null then "" else "yes" end')
+          want_csv=$(echo  "$OUTPUT_FORMATS" | jq -r 'index("csv")  | if . == null then "" else "yes" end')
+          want_html=$(echo "$OUTPUT_FORMATS" | jq -r 'index("html") | if . == null then "" else "yes" end')
+
+          for scan_type in $(echo "$SCAN_TYPES_INPUT" | jq -r '.[]'); do
+            JSON_FILE="$OUT_DIR/cycode-$scan_type.json"
+            if [ ! -s "$JSON_FILE" ]; then
+              echo "::warning::Skipping report generation for $scan_type — JSON missing or empty."
+              continue
+            fi
+
+            SUMMARY_MD="$SUMMARY_DIR/cycode-$scan_type.md"
+            ARGS=(--no-title --md "$SUMMARY_MD")
+            if [ -n "$want_csv" ];  then ARGS+=(--csv  "$OUT_DIR/cycode-$scan_type.csv");  fi
+            if [ -n "$want_html" ]; then ARGS+=(--html "$OUT_DIR/cycode-$scan_type.html"); fi
+
+            echo "::group::Generate $scan_type reports"
+            CYCODE_SCAN_TYPE="$scan_type" \
+            CYCODE_SCAN_MODE="$SCAN_MODE" \
+            CYCODE_BASE_COMMIT="$BASE_COMMIT" \
+              python3 "$SUMMARY_SCRIPT" "$JSON_FILE" "${ARGS[@]}"
+            # Mirror MD into OUT_DIR if the caller requested it for the artifact.
+            if [ -n "$want_md" ]; then
+              cp "$SUMMARY_MD" "$OUT_DIR/cycode-$scan_type.md"
+            fi
+            echo "::endgroup::"
+          done
+          ls -la "$OUT_DIR"
+
+      # ---- Append per-scan-type rich MD to the job summary --------------
       - name: Build job summary
         if: always()
         shell: bash
@@ -233,7 +315,8 @@ jobs:
             echo "## Cycode scan summary"
             echo ""
             echo "- **Repo:** \`${{ github.repository }}\`"
-            echo "- **Ref:** \`${{ github.ref }}\`"
+            echo "- **Ref:** \`${{ github.ref_name }}\`"
+            echo "- **Commit:** \`${{ github.sha }}\`"
             echo "- **Scan mode:** \`$SCAN_MODE\`"
             if [ "$SCAN_MODE" = "diff" ] && [ -n "$BASE_COMMIT" ]; then
               echo "- **Diff base:** \`$BASE_COMMIT\`"
@@ -243,41 +326,74 @@ jobs:
             echo ""
           } >> "$GITHUB_STEP_SUMMARY"
 
-          # jq filter that pulls detections from either envelope shape
-          # Cycode emits (.scan_results[].detections OR top-level .detections)
-          # and normalizes severity to lowercase for counting.
-          DETECT_FILTER='[(.scan_results[]?.detections[]?), (.detections[]?)]'
+          for scan_type in $(echo "$SCAN_TYPES_INPUT" | jq -r '.[]'); do
+            SUMMARY_MD="$SUMMARY_DIR/cycode-$scan_type.md"
+            if [ -s "$SUMMARY_MD" ]; then
+              cat "$SUMMARY_MD" >> "$GITHUB_STEP_SUMMARY"
+              echo "" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "### Cycode $scan_type" >> "$GITHUB_STEP_SUMMARY"
+              echo "" >> "$GITHUB_STEP_SUMMARY"
+              echo "_Scan output missing or report generation failed. See step logs._" >> "$GITHUB_STEP_SUMMARY"
+              echo "" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
+
+      # ---- Emit per-finding ::error annotations -------------------------
+      # One annotation per detection at or above severityThreshold. These
+      # render inline in the file diff on the run page and at the top of
+      # the run summary — closest match to the native Cycode PR scan UX.
+      - name: Emit annotations
+        if: always()
+        shell: bash
+        env:
+          SCAN_TYPES_INPUT: ${{ inputs.scanTypes }}
+          SEVERITY_THRESHOLD: ${{ inputs.severityThreshold }}
+        run: |
+          set -e
+          # Lookup table: severity → numeric rank for >= comparison.
+          declare -A RANK=([critical]=5 [high]=4 [medium]=3 [low]=2 [info]=1)
+          MIN=${RANK[$SEVERITY_THRESHOLD]:-4}
 
           for scan_type in $(echo "$SCAN_TYPES_INPUT" | jq -r '.[]'); do
             JSON_FILE="$OUT_DIR/cycode-$scan_type.json"
-            echo "### Cycode $scan_type" >> "$GITHUB_STEP_SUMMARY"
-            echo "" >> "$GITHUB_STEP_SUMMARY"
-            if [ ! -s "$JSON_FILE" ] || ! jq -e 'has("scan_results") or has("detections")' "$JSON_FILE" >/dev/null 2>&1; then
-              echo "Scan output missing or malformed. See the \`Run Cycode scans\` step log for the failure." >> "$GITHUB_STEP_SUMMARY"
-              echo "" >> "$GITHUB_STEP_SUMMARY"
-              continue
-            fi
-            total=$(jq "$DETECT_FILTER | length" "$JSON_FILE")
-            crit=$(jq "$DETECT_FILTER | map(select((.severity // .detection_details.severity // \"\" | ascii_downcase) == \"critical\")) | length" "$JSON_FILE")
-            high=$(jq "$DETECT_FILTER | map(select((.severity // .detection_details.severity // \"\" | ascii_downcase) == \"high\"))     | length" "$JSON_FILE")
-            med=$(jq  "$DETECT_FILTER | map(select((.severity // .detection_details.severity // \"\" | ascii_downcase) == \"medium\"))   | length" "$JSON_FILE")
-            low=$(jq  "$DETECT_FILTER | map(select((.severity // .detection_details.severity // \"\" | ascii_downcase) == \"low\"))      | length" "$JSON_FILE")
-            {
-              echo "Total: $total · Critical: $crit · High: $high · Medium: $med · Low: $low"
-              echo ""
-            } >> "$GITHUB_STEP_SUMMARY"
+            [ -s "$JSON_FILE" ] || continue
+
+            # Emit one ::error per finding ≥ threshold.
+            # Fields: file (from detection_details.file_path), line, policy
+            # display name, short description (escaped for the annotation
+            # title/message single-line constraint).
+            jq -r --argjson min "$MIN" --arg scan_type "$scan_type" '
+              def rank: ({critical:5, high:4, medium:3, low:2, info:1}[. // ""]) // 0;
+              def clean: tostring | gsub("[\r\n]+"; " ") | gsub("%"; "%25") | gsub(":"; "%3A") | gsub(","; "%2C");
+              [(.scan_results[]?.detections[]?), (.detections[]?)] |
+              .[] |
+              . as $d |
+              (($d.severity // $d.detection_details.severity // "") | ascii_downcase | rank) as $r |
+              select($r >= $min) |
+              ($d.detection_details.file_path // $d.detection_details.file // "")        as $file |
+              ($d.detection_details.line // $d.detection_details.start_position // 1)    as $line |
+              ($d.detection_details.policy_display_name // $d.message // "Cycode finding") as $policy |
+              ($d.detection_details.description // $d.message // "")                      as $desc |
+              "::error file=" + ($file | clean) +
+                ",line=" + ($line | tostring) +
+                ",title=Cycode " + $scan_type + ": " + ($policy | clean) +
+                "::" + ($desc | clean)
+            ' "$JSON_FILE" || true
           done
 
-      # ---- Upload raw JSON for every scan type as one artifact ----------
+      # ---- Upload Cycode scan results -----------------------------------
+      # Glob picks up whatever's in OUT_DIR — JSON always, plus the formats
+      # the caller requested via outputFormats.
       - name: Upload Cycode scan results
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: cycode-scan-results
-          path: ${{ env.OUT_DIR }}/cycode-*.json
+          path: ${{ env.OUT_DIR }}/cycode-*
           if-no-files-found: warn
           # OUT_DIR is a dot-prefixed directory; upload-artifact skips dotfile
-          # paths by default. Required to actually publish the JSON.
+          # paths by default. Required to actually publish the artifact.
           include-hidden-files: true
 
       # ---- Gate ---------------------------------------------------------

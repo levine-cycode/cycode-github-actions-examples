@@ -276,6 +276,9 @@ jobs:
           name: cycode-scan-results
           path: ${{ env.OUT_DIR }}/cycode-*.json
           if-no-files-found: warn
+          # OUT_DIR is a dot-prefixed directory; upload-artifact skips dotfile
+          # paths by default. Required to actually publish the JSON.
+          include-hidden-files: true
 
       # ---- Gate ---------------------------------------------------------
       # Loud-fails on missing/malformed output or non-empty .errors[] so an

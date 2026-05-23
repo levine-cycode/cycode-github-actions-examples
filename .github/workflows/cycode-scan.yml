@@ -78,12 +78,11 @@ jobs:
       contents: read
     env:
       OUT_DIR: ${{ github.workspace }}/.cycode-out
-      # Summary MDs live in runner.temp so they're available to the job-summary
-      # step even when the caller didn't request md as an artifact format.
-      SUMMARY_DIR: ${{ runner.temp }}/cycode-summary
-      SUMMARY_SCRIPT: ${{ runner.temp }}/cycode-summary.py
       CYCODE_CLIENT_ID: ${{ secrets.CYCODE_CLIENT_ID }}
       CYCODE_CLIENT_SECRET: ${{ secrets.CYCODE_CLIENT_SECRET }}
+    # NOTE: SUMMARY_DIR + SUMMARY_SCRIPT are derived inside each step from
+    # the runner-provided $RUNNER_TEMP shell env var. The ${{ runner.* }}
+    # GH context is not allowed at job-level env, only at step level.
     steps:
       # ---- Validate inputs at the top so misconfiguration fails loudly --
       - name: Validate inputs
@@ -153,6 +152,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          SUMMARY_DIR="$RUNNER_TEMP/cycode-summary"
+          SUMMARY_SCRIPT="$RUNNER_TEMP/cycode-summary.py"
           mkdir -p "$SUMMARY_DIR"
           curl -fsSL \
             "https://raw.githubusercontent.com/levine-cycode/cycode-github-actions-examples/main/scripts/cycode-summary.py" \
@@ -269,6 +270,8 @@ jobs:
           BASE_COMMIT: ${{ steps.resolve.outputs.base }}
         run: |
           set -e
+          SUMMARY_DIR="$RUNNER_TEMP/cycode-summary"
+          SUMMARY_SCRIPT="$RUNNER_TEMP/cycode-summary.py"
           mkdir -p "$OUT_DIR" "$SUMMARY_DIR"
           want_md=$(echo   "$OUTPUT_FORMATS" | jq -r 'index("md")   | if . == null then "" else "yes" end')
           want_csv=$(echo  "$OUTPUT_FORMATS" | jq -r 'index("csv")  | if . == null then "" else "yes" end')
@@ -311,6 +314,7 @@ jobs:
           BASE_COMMIT: ${{ steps.resolve.outputs.base }}
         run: |
           set -e
+          SUMMARY_DIR="$RUNNER_TEMP/cycode-summary"
           {
             echo "## Cycode scan summary"
             echo ""

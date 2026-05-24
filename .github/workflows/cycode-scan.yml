@@ -363,26 +363,56 @@ jobs:
             JSON_FILE="$OUT_DIR/cycode-$scan_type.json"
             [ -s "$JSON_FILE" ] || continue
 
-            # Emit one ::error per finding ≥ threshold.
-            # Fields: file (from detection_details.file_path), line, policy
-            # display name, short description (escaped for the annotation
-            # title/message single-line constraint).
-            jq -r --argjson min "$MIN" --arg scan_type "$scan_type" '
+            # Emit one ::error per finding ≥ threshold. GitHub annotations need
+            # a repo-relative file path, a positive line number, and URL-encoded
+            # params (file/title — commas + colons must be %2C/%3A). The
+            # message after the second `::` only needs %, CR, LF encoded.
+            #
+            # Cycode field quirks handled here:
+            # - Secret detections: file_path is the workspace dir, file_name has
+            #   the filename. Combine when file_path ends with "/".
+            # - SCA: line is -1 (whole-file finding). Floor to 1 so GH accepts.
+            # - All: file_path may be absolute under the runner workspace
+            #   ("/home/runner/work/<repo>/<repo>/...") — strip that prefix.
+            jq -r \
+              --argjson min "$MIN" \
+              --arg scan_type "$scan_type" \
+              --arg ws "$GITHUB_WORKSPACE" \
+              '
               def rank: ({critical:5, high:4, medium:3, low:2, info:1}[. // ""]) // 0;
-              def clean: tostring | gsub("[\r\n]+"; " ") | gsub("%"; "%25") | gsub(":"; "%3A") | gsub(","; "%2C");
+              def encode_param:   tostring | gsub("[\r\n]+"; " ") | gsub("%"; "%25") | gsub(":"; "%3A") | gsub(","; "%2C");
+              def encode_message: tostring | gsub("[\r\n]+"; " ") | gsub("%"; "%25");
+              ($ws + "/")              as $prefix_abs |
+              (($ws | ltrimstr("/")) + "/") as $prefix_rel |
               [(.scan_results[]?.detections[]?), (.detections[]?)] |
               .[] |
               . as $d |
               (($d.severity // $d.detection_details.severity // "") | ascii_downcase | rank) as $r |
               select($r >= $min) |
-              ($d.detection_details.file_path // $d.detection_details.file // "")        as $file |
-              ($d.detection_details.line // $d.detection_details.start_position // 1)    as $line |
+              ($d.detection_details.file_path // "") as $fp |
+              ($d.detection_details.file_name // "") as $fn |
+              (
+                # Combine path + name when secret-scan reports them split.
+                if $fn != "" and ($fp | endswith("/")) then ($fp + $fn)
+                elif $fp == "" then $fn
+                else $fp
+                end
+                # Strip the GH workspace prefix in both absolute and
+                # leading-slash-stripped forms (Cycode CLI emits both).
+                | if   startswith($prefix_abs) then .[($prefix_abs | length):]
+                  elif startswith($prefix_rel) then .[($prefix_rel | length):]
+                  else .
+                  end
+                | ltrimstr("/")
+              ) as $file |
+              ($d.detection_details.line // 0) as $rawline |
+              (if ($rawline | type) == "number" and $rawline > 0 then $rawline else 1 end) as $line |
               ($d.detection_details.policy_display_name // $d.message // "Cycode finding") as $policy |
               ($d.detection_details.description // $d.message // "")                      as $desc |
-              "::error file=" + ($file | clean) +
+              "::error file=" + ($file | encode_param) +
                 ",line=" + ($line | tostring) +
-                ",title=Cycode " + $scan_type + ": " + ($policy | clean) +
-                "::" + ($desc | clean)
+                ",title=Cycode " + $scan_type + ": " + ($policy | encode_param) +
+                "::" + ($desc | encode_message)
             ' "$JSON_FILE" || true
           done
 

@@ -18,8 +18,9 @@ jobs:
   cycode:
     uses: ./.github/workflows/cycode-scan.yml
     with:
-      scanTypes: '["secret","sca","iac"]'
+      scanTypes: '["secret","sast","sca","iac"]'
       severityThreshold: high
+      outputFormats: '["json","csv","md","html"]'
       # Demo repo: report findings without failing PRs.
       blockOnFindings: false
     secrets: inherit

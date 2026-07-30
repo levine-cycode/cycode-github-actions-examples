@@ -328,19 +328,54 @@ jobs:
             echo "- **Severity threshold:** \`$SEVERITY_THRESHOLD\`"
             echo "- **Block on findings:** \`$BLOCK_ON_FINDINGS\`"
             echo ""
+            echo "### Findings by scan type"
+            echo ""
+            echo "| Scan type | Critical | High | Medium | Low | Info | Total |"
+            echo "| --- | --- | --- | --- | --- | --- | --- |"
           } >> "$GITHUB_STEP_SUMMARY"
 
+          # Compact totals table — one row per scan type, counted by severity
+          # from the raw JSON. Keeps the summary readable no matter how many
+          # findings; full per-finding detail stays in the uploaded artifact.
+          for scan_type in $(echo "$SCAN_TYPES_INPUT" | jq -r '.[]'); do
+            JSON_FILE="$OUT_DIR/cycode-$scan_type.json"
+            if [ -s "$JSON_FILE" ]; then
+              read -r C H M L I T <<< "$(jq -r '
+                [(.scan_results[]?.detections[]?), (.detections[]?)]
+                | map((.severity // .detection_details.severity // "info") | ascii_downcase)
+                | [ (map(select(.=="critical"))|length),
+                    (map(select(.=="high"))|length),
+                    (map(select(.=="medium"))|length),
+                    (map(select(.=="low"))|length),
+                    (map(select(.=="info"))|length),
+                    length ] | @tsv' "$JSON_FILE")"
+              echo "| \`$scan_type\` | $C | $H | $M | $L | $I | **$T** |" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "| \`$scan_type\` | - | - | - | - | - | _no output_ |" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
+
+          {
+            echo ""
+            echo "_Full per-finding detail is in the **cycode-scan-results** artifact (json/csv/html) attached to this run._"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Detailed per-type reports, collapsed so they never bury the table.
           for scan_type in $(echo "$SCAN_TYPES_INPUT" | jq -r '.[]'); do
             SUMMARY_MD="$SUMMARY_DIR/cycode-$scan_type.md"
-            if [ -s "$SUMMARY_MD" ]; then
-              cat "$SUMMARY_MD" >> "$GITHUB_STEP_SUMMARY"
-              echo "" >> "$GITHUB_STEP_SUMMARY"
-            else
-              echo "### Cycode $scan_type" >> "$GITHUB_STEP_SUMMARY"
-              echo "" >> "$GITHUB_STEP_SUMMARY"
-              echo "_Scan output missing or report generation failed. See step logs._" >> "$GITHUB_STEP_SUMMARY"
-              echo "" >> "$GITHUB_STEP_SUMMARY"
-            fi
+            {
+              echo "<details><summary>Cycode ${scan_type} — detailed findings</summary>"
+              echo ""
+              if [ -s "$SUMMARY_MD" ]; then
+                cat "$SUMMARY_MD"
+              else
+                echo "_Scan output missing or report generation failed. See step logs._"
+              fi
+              echo ""
+              echo "</details>"
+              echo ""
+            } >> "$GITHUB_STEP_SUMMARY"
           done
 
       # ---- Emit per-finding ::error annotations -------------------------

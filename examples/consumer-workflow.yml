@@ -4,7 +4,9 @@
 #   1. Copy this file to .github/workflows/cycode-scan.yml in your repo.
 #   2. Add CYCODE_CLIENT_ID and CYCODE_CLIENT_SECRET as repository secrets
 #      (Settings → Secrets and variables → Actions → New repository secret).
-#   3. Adjust the `uses:` pin and the `with:` inputs as needed.
+#   3. Adjust the `uses:` pin and the `with:` inputs as needed. For this
+#      repo the pin is:
+#        levine-cycode/cycode-github-actions-examples/.github/workflows/cycode-scan.yml@v1
 
 name: Cycode security scan
 
@@ -31,6 +33,12 @@ jobs:
       # false → scan and publish summary without failing
       blockOnFindings: true
 
+      # Pin the Cycode CLI release. '' installs the latest from PyPI.
+      cliVersion: '3.27.1'
+
+      # Optional: artifact formats. JSON is always produced for the gate.
+      # outputFormats: '["json","csv","html"]'
+
       # Optional: ubuntu-latest (default) | windows-2022 | macos-latest | self-hosted
       # runsOn: ubuntu-latest
 
@@ -38,4 +46,9 @@ jobs:
       # Override with 'diff' or 'full' to force.
       # scanMode: ''
 
+    # Works when this repo and the reusable workflow share an owner. If the
+    # reusable workflow lives under another user or org, pass them explicitly:
+    #   secrets:
+    #     CYCODE_CLIENT_ID: ${{ secrets.CYCODE_CLIENT_ID }}
+    #     CYCODE_CLIENT_SECRET: ${{ secrets.CYCODE_CLIENT_SECRET }}
     secrets: inherit

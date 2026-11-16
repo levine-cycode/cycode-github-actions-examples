@@ -17,7 +17,8 @@
 #
 # Behavior summary:
 #   - Runs on ubuntu-latest by default (override via runsOn input).
-#   - Installs the Cycode CLI via `pip install cycode`.
+#   - Installs the Cycode CLI via `pip install cycode` (latest, or the
+#     version pinned with the cliVersion input). Tested with CLI 3.27.1.
 #   - Auto-detects scan mode from the triggering event
 #     (push / pull_request → diff, manual / schedule → full).
 #   - For diff scans, BASE is taken from the event payload.
@@ -30,6 +31,10 @@
 #     HTML are added when listed in outputFormats.
 #   - Fails the job on findings at or above severityThreshold when
 #     blockOnFindings is true; otherwise scans and reports without failing.
+#
+# Runner requirements: actions/checkout@v7, setup-python@v7 and
+# upload-artifact@v7 run on Node.js 24. GitHub-hosted runners are fine;
+# self-hosted runners need Actions Runner 2.327.1 or newer.
 
 name: Cycode Scan
 
@@ -60,6 +65,10 @@ on:
         description: 'JSON array of artifact formats. Subset of ["json","csv","md","html"]. JSON is always included regardless (gate dependency); the others are added on request. Default ["json"].'
         type: string
         default: '["json"]'
+      cliVersion:
+        description: 'Cycode CLI version to install, e.g. "3.27.1". Empty string = latest from PyPI. Pin this in production so a CLI release cannot change gate behavior without a review.'
+        type: string
+        default: ''
     secrets:
       CYCODE_CLIENT_ID:
         required: true
@@ -92,8 +101,12 @@ jobs:
           SEVERITY_INPUT: ${{ inputs.severityThreshold }}
           SCAN_MODE_INPUT: ${{ inputs.scanMode }}
           OUTPUT_FORMATS_INPUT: ${{ inputs.outputFormats }}
+          CLI_VERSION_INPUT: ${{ inputs.cliVersion }}
         run: |
           set -euo pipefail
+          if [ -n "$CLI_VERSION_INPUT" ] && ! [[ "$CLI_VERSION_INPUT" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::cliVersion must be a release version like 3.27.1 or empty for latest (got '$CLI_VERSION_INPUT')"; exit 1
+          fi
           case "$SEVERITY_INPUT" in
             info|low|medium|high|critical) ;;
             *) echo "::error::severityThreshold must be one of info|low|medium|high|critical (got '$SEVERITY_INPUT')"; exit 1 ;;
@@ -125,7 +138,7 @@ jobs:
 
       # ---- Checkout caller repo with full history for diff scans --------
       - name: Checkout repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -136,27 +149,42 @@ jobs:
         run: git config --global core.longpaths true || true
 
       - name: Set up Python 3.12
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: '3.12'
 
+      # Pin with cliVersion in production. `cycode status` prints the
+      # installed version, OS and Python so the run log shows what scanned.
       - name: Install Cycode CLI
         shell: bash
-        run: pip install --quiet cycode
+        env:
+          CLI_VERSION_INPUT: ${{ inputs.cliVersion }}
+        run: |
+          set -euo pipefail
+          if [ -n "$CLI_VERSION_INPUT" ]; then
+            pip install --quiet "cycode==$CLI_VERSION_INPUT"
+          else
+            pip install --quiet cycode
+          fi
+          cycode --no-update-notifier status
 
       # ---- Fetch the summary-report generator script --------------------
       # Lands in runner.temp (outside the workspace) so it isn't scanned as
-      # caller-repo source. Sourced from this templates repo's main branch;
-      # consumers who fork should change the URL.
+      # caller-repo source. Fetched at the same commit as this workflow file
+      # (github.job_workflow_sha), so a consumer pinned to a tag or SHA gets
+      # the matching script, not whatever is on main. Forks: change the URL.
       - name: Fetch Cycode summary script
         shell: bash
+        env:
+          WORKFLOW_SHA: ${{ github.job_workflow_sha }}
         run: |
           set -euo pipefail
           SUMMARY_DIR="$RUNNER_TEMP/cycode-summary"
           SUMMARY_SCRIPT="$RUNNER_TEMP/cycode-summary.py"
           mkdir -p "$SUMMARY_DIR"
+          REF="${WORKFLOW_SHA:-main}"
           curl -fsSL \
-            "https://raw.githubusercontent.com/levine-cycode/cycode-github-actions-examples/main/scripts/cycode-summary.py" \
+            "https://raw.githubusercontent.com/levine-cycode/cycode-github-actions-examples/${REF}/scripts/cycode-summary.py" \
             -o "$SUMMARY_SCRIPT"
           python3 -c "import py_compile; py_compile.compile('$SUMMARY_SCRIPT', doraise=True)"
           echo "Fetched and compiled $SUMMARY_SCRIPT"
@@ -238,14 +266,14 @@ jobs:
             OUT_FILE="$OUT_DIR/cycode-$scan_type.json"
             if [ "$SCAN_MODE" = "diff" ] && [ "$scan_type" != "iac" ] && [ -n "$BASE_COMMIT" ]; then
               echo "::group::Cycode $scan_type scan (diff: $BASE_COMMIT..HEAD)"
-              cycode --verbose -o json scan --soft-fail \
+              cycode --verbose --no-update-notifier -o json scan --soft-fail \
                 -t "$scan_type" \
                 --severity-threshold "$SEVERITY_THRESHOLD" \
                 commit-history -r "$BASE_COMMIT..HEAD" . \
                 > "$OUT_FILE" || true
             else
               echo "::group::Cycode $scan_type scan (full tree, path mode)"
-              cycode --verbose -o json scan --soft-fail \
+              cycode --verbose --no-update-notifier -o json scan --soft-fail \
                 -t "$scan_type" \
                 --severity-threshold "$SEVERITY_THRESHOLD" \
                 path . \
@@ -456,7 +484,7 @@ jobs:
       # the caller requested via outputFormats.
       - name: Upload Cycode scan results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cycode-scan-results
           path: ${{ env.OUT_DIR }}/cycode-*
